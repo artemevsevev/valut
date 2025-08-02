@@ -1,22 +1,50 @@
 use std::{collections::HashMap, str::FromStr};
 
 use anyhow::Result;
-use chrono::NaiveDate;
+use chrono::{Days, NaiveDate, Utc};
 use reqwest::Client;
 use rust_decimal::Decimal;
-use val_curs::{ValCurs, Valute};
+use val_curs::ValCurs;
 
 mod val_curs;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let val_curs = get_val_curs(NaiveDate::from_ymd(2025, 8, 5)).await?;
-    dbg!(&val_curs);
-    let map = get_curs_map(&val_curs).await?;
+    let today = Utc::now().date_naive();
+    let start_date = today
+        .checked_sub_days(Days::new(6))
+        .ok_or(anyhow::anyhow!("Can't get previous date for {}", today))?;
+    let end_date = today
+        .checked_add_days(Days::new(1))
+        .ok_or(anyhow::anyhow!("Can't get next date for {}", today))?;
 
-    dbg!(map);
+    iterate(start_date, end_date).await?;
 
     Ok(())
+}
+
+async fn iterate(start_date: NaiveDate, end_date: NaiveDate) -> Result<()> {
+    if start_date > end_date {
+        return Err(anyhow::anyhow!("Start date must be before end date"));
+    }
+
+    let mut current_date = end_date;
+
+    while current_date >= start_date {
+        let exchange_rates = get_exchange_rates_for_date(current_date).await?;
+        println!("Exchange rates for {}: {:?}", current_date, exchange_rates);
+
+        current_date = current_date
+            .pred_opt()
+            .ok_or(anyhow::anyhow!("Can't get pred date for {}", current_date))?;
+    }
+
+    Ok(())
+}
+
+async fn get_exchange_rates_for_date(date: NaiveDate) -> Result<HashMap<String, Decimal>> {
+    let val_curs = get_val_curs(date).await?;
+    Ok(get_curs_map(&val_curs).await?)
 }
 
 async fn get_curs_map(val_curs: &ValCurs) -> Result<HashMap<String, Decimal>> {
@@ -47,7 +75,7 @@ async fn load_xml(url: &str) -> Result<String> {
     let client = Client::new();
     let resp = client.get(url).send().await?;
     if !resp.status().is_success() {
-        anyhow::bail!("Cannot download file: {}", resp.status());
+        anyhow::bail!("Can't download the file: {}", resp.status());
     }
 
     let text = resp.text().await?;
