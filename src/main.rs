@@ -138,9 +138,9 @@ async fn set_exchange_rate(
     let exchange_rate: Option<ExchangeRate> = sqlx::query_as!(
         ExchangeRate,
         r#"
-        SELECT id, from_currency, to_currency, rate, date, created_at, updated_at
-        FROM exchange_rates
-        WHERE from_currency = $1 AND to_currency = $2 AND date = $3
+            SELECT id, rate
+            FROM exchange_rates
+            WHERE from_currency = $1 AND to_currency = $2 AND date = $3
         "#,
         from_currency,
         to_currency,
