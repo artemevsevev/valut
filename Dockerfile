@@ -15,4 +15,7 @@ RUN apt-get update && \
 
 COPY --from=builder /usr/local/cargo/bin/valut /usr/local/bin/valut
 
+HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
+    CMD curl -f http://localhost:8000/health || exit 1
+
 ENTRYPOINT ["valut"]
