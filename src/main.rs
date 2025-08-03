@@ -21,6 +21,7 @@ async fn main() -> Result<()> {
     let start_date = today
         .checked_sub_days(Days::new(6))
         .ok_or(anyhow::anyhow!("Can't get previous date for {}", today))?;
+    let start_date = NaiveDate::from_ymd_opt(2024, 12, 01).unwrap();
     let end_date = today
         .checked_add_days(Days::new(1))
         .ok_or(anyhow::anyhow!("Can't get next date for {}", today))?;
@@ -121,8 +122,8 @@ async fn update_stored_exchange_rates(
         let reverse_rate = Decimal::ONE / rate;
         let rub = "RUB".to_string();
 
-        set_exchange_rate(date, &rub, currency, rate, pool).await?;
-        set_exchange_rate(date, currency, &rub, &reverse_rate, pool).await?;
+        set_exchange_rate(date, currency, &rub, rate, pool).await?;
+        set_exchange_rate(date, &rub, currency, &reverse_rate, pool).await?;
     }
 
     Ok(())
