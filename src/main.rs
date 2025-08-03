@@ -14,6 +14,7 @@ mod val_curs;
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    env_logger::init();
     dotenv::dotenv().ok();
 
     let today = Utc::now().date_naive();
