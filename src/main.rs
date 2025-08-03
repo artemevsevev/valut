@@ -1,4 +1,4 @@
-use std::{collections::HashMap, env, str::FromStr};
+use std::{collections::HashMap, env, str::FromStr, time::Duration};
 
 use actix_web::{App, HttpResponse, HttpServer, Responder, get};
 use anyhow::{Result, anyhow};
@@ -6,6 +6,7 @@ use chrono::{Days, NaiveDate, Utc};
 use reqwest::Client;
 use rust_decimal::Decimal;
 use sqlx::{PgPool, Pool, Postgres};
+use tokio::signal::unix::{SignalKind, signal};
 use val_curs::ValCurs;
 
 use crate::exchange_rate::ExchangeRate;
@@ -20,18 +21,40 @@ async fn main() -> Result<()> {
 
     start_server().await?;
 
-    println!("Starting");
+    log::info!("Valut started");
 
-    let today = Utc::now().date_naive();
-    let start_date = today
-        .checked_sub_days(Days::new(6))
-        .ok_or(anyhow::anyhow!("Can't get previous date for {}", today))?;
-    let end_date = today
-        .checked_add_days(Days::new(1))
-        .ok_or(anyhow::anyhow!("Can't get next date for {}", today))?;
+    tokio::select! {
+        _ = async {
+            loop {
+                execute().await?;
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            }
 
-    iterate(start_date, end_date).await?;
+            #[allow(unreachable_code)]
+            Ok::<(), anyhow::Error>(())
+        } => {},
 
+        _ = shutdown_signal() => {
+        },
+    };
+
+    log::info!("Valut ended");
+
+    Ok(())
+}
+
+async fn shutdown_signal() -> Result<()> {
+    let mut sigterm = signal(SignalKind::terminate())?;
+    let mut sigint = signal(SignalKind::interrupt())?;
+
+    tokio::select! {
+        _ = sigterm.recv() => {
+            log::info!("SIGTERM received; starting forced shutdown");
+        }
+        _ = sigint.recv() => {
+            log::info!("SIGINT received; starting forced shutdown");
+        }
+    }
     Ok(())
 }
 
@@ -48,6 +71,20 @@ async fn start_server() -> Result<()> {
 #[get("/health")]
 async fn health() -> impl Responder {
     HttpResponse::Ok().body("OK")
+}
+
+async fn execute() -> Result<()> {
+    let today = Utc::now().date_naive();
+    let start_date = today
+        .checked_sub_days(Days::new(6))
+        .ok_or(anyhow::anyhow!("Can't get previous date for {}", today))?;
+    let end_date = today
+        .checked_add_days(Days::new(1))
+        .ok_or(anyhow::anyhow!("Can't get next date for {}", today))?;
+
+    iterate(start_date, end_date).await?;
+
+    Ok(())
 }
 
 async fn iterate(start_date: NaiveDate, end_date: NaiveDate) -> Result<()> {
