@@ -1,5 +1,6 @@
 use std::{collections::HashMap, env, str::FromStr};
 
+use actix_web::{App, HttpResponse, HttpServer, Responder, get};
 use anyhow::{Result, anyhow};
 use chrono::{Days, NaiveDate, Utc};
 use reqwest::Client;
@@ -17,6 +18,10 @@ async fn main() -> Result<()> {
     env_logger::init();
     dotenv::dotenv().ok();
 
+    start_server().await?;
+
+    println!("Starting");
+
     let today = Utc::now().date_naive();
     let start_date = today
         .checked_sub_days(Days::new(6))
@@ -28,6 +33,21 @@ async fn main() -> Result<()> {
     iterate(start_date, end_date).await?;
 
     Ok(())
+}
+
+async fn start_server() -> Result<()> {
+    let server = HttpServer::new(|| App::new().service(health))
+        .bind("0.0.0.0:8000")?
+        .run();
+
+    tokio::spawn(server);
+
+    Ok(())
+}
+
+#[get("/health")]
+async fn health() -> impl Responder {
+    HttpResponse::Ok().body("OK")
 }
 
 async fn iterate(start_date: NaiveDate, end_date: NaiveDate) -> Result<()> {
