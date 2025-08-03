@@ -2,7 +2,7 @@ use std::{collections::HashMap, env, str::FromStr, time::Duration};
 
 use actix_web::{App, HttpResponse, HttpServer, Responder, get};
 use anyhow::{Result, anyhow};
-use chrono::{Days, NaiveDate, Utc};
+use chrono::{DateTime, Days, NaiveDate, Timelike, Utc};
 use reqwest::Client;
 use rust_decimal::Decimal;
 use sqlx::{PgPool, Pool, Postgres};
@@ -13,6 +13,9 @@ use crate::exchange_rate::ExchangeRate;
 
 mod exchange_rate;
 mod val_curs;
+
+const DELAY_SEC: u64 = 60 * 20;
+const RETRYDELAY_SEC: u64 = 5;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -25,10 +28,7 @@ async fn main() -> Result<()> {
 
     tokio::select! {
         _ = async {
-            loop {
-                execute().await?;
-                tokio::time::sleep(Duration::from_secs(5)).await;
-            }
+            main_loop().await;
 
             #[allow(unreachable_code)]
             Ok::<(), anyhow::Error>(())
@@ -41,6 +41,53 @@ async fn main() -> Result<()> {
     log::info!("Valut ended");
 
     Ok(())
+}
+
+async fn main_loop() {
+    let mut retry_count = 0;
+    let mut delay_sec = 0;
+    let mut last_execution = DateTime::<Utc>::MIN_UTC;
+    let mut last_try = DateTime::<Utc>::MIN_UTC;
+
+    loop {
+        let next_execution = last_execution + Duration::from_secs(DELAY_SEC);
+        let next_try = last_try + Duration::from_secs(delay_sec);
+        let now = Utc::now();
+
+        if (now >= next_execution
+            || last_execution.date_naive() != now.date_naive()
+            || last_execution.hour() != now.hour())
+            && now >= next_try
+        {
+            last_try = Utc::now();
+
+            match execute().await {
+                Ok(_) => {
+                    retry_count = 0;
+                    delay_sec = 0;
+                    last_execution = Utc::now();
+                    last_try = DateTime::<Utc>::MIN_UTC;
+                }
+
+                Err(err) => {
+                    log::error!("Error executing task: {}", err);
+                    retry_count += 1;
+                    delay_sec = match delay_sec {
+                        0 => RETRYDELAY_SEC,
+                        n => next_delay(n),
+                    };
+                    dbg!(retry_count, delay_sec);
+                }
+            }
+        };
+
+        if retry_count > 10 {
+            log::error!("Max retries exceeded");
+            break;
+        }
+
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
 }
 
 async fn shutdown_signal() -> Result<()> {
@@ -279,4 +326,9 @@ async fn get_connection_string() -> Result<String> {
 
 fn get_currencies() -> Vec<String> {
     vec!["USD".to_string(), "EUR".to_string()]
+}
+
+fn next_delay(value: u64) -> u64 {
+    let phi = (1.0 + 5.0_f64.sqrt()) / 2.0;
+    (phi * (value as f64)).round() as u64
 }
