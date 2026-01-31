@@ -1,5 +1,5 @@
 # Build stage with musl for static linking
-FROM rust:1.83-bookworm AS builder
+FROM rust:1.85-bookworm AS builder
 
 # Install musl target for static linking
 RUN rustup target add x86_64-unknown-linux-musl && \
