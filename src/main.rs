@@ -20,7 +20,7 @@ const RETRYDELAY_SEC: u64 = 5;
 #[tokio::main]
 async fn main() -> Result<()> {
     env_logger::init();
-    dotenv::dotenv().ok();
+    dotenvy::dotenv().ok();
 
     start_server().await?;
 
