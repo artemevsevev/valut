@@ -70,7 +70,7 @@ async fn main_loop() {
                 }
 
                 Err(err) => {
-                    log::error!("Error executing task: {}", err);
+                    log::error!("Error executing task: {:?}", err);
                     retry_count += 1;
                     delay_sec = match delay_sec {
                         0 => RETRYDELAY_SEC,
@@ -167,9 +167,10 @@ async fn get_curs_map(val_curs: &ValCurs) -> Result<HashMap<String, Decimal>> {
 
     for valute in &val_curs.valute {
         let normalized_string = normalize_decimal_string(&valute.vunit_rate);
-        let value = Decimal::from_str(&normalized_string)?;
 
-        map.insert(valute.char_code.clone(), value);
+        if let Some(value) = parse_decimal_string(&normalized_string) {
+            map.insert(valute.char_code.clone(), value);
+        }
     }
 
     Ok(map)
@@ -331,4 +332,34 @@ fn get_currencies() -> Vec<String> {
 fn next_delay(value: u64) -> u64 {
     let phi = (1.0 + 5.0_f64.sqrt()) / 2.0;
     (phi * (value as f64)).round() as u64
+}
+
+fn parse_decimal_string(s: &str) -> Option<Decimal> {
+    // Проверяем наличие научной нотации (e или E)
+    if let Some(e_pos) = s.find(['e', 'E']) {
+        // Разделяем на мантиссу и экспоненту
+        let (mantissa_str, exp_str) = s.split_at(e_pos);
+        let exp_str = &exp_str[1..]; // Пропускаем символ 'e' или 'E'
+
+        // Парсим мантиссу и экспоненту
+        let mantissa = Decimal::from_str(mantissa_str).ok()?;
+        let exponent: i32 = exp_str.parse().ok()?;
+
+        // Вычисляем 10^|exponent|
+        let ten = Decimal::from(10);
+        let mut power = Decimal::ONE;
+        for _ in 0..exponent.abs() {
+            power = power.checked_mul(ten)?;
+        }
+
+        // Применяем экспоненту
+        if exponent >= 0 {
+            mantissa.checked_mul(power)
+        } else {
+            mantissa.checked_div(power)
+        }
+    } else {
+        // Обычный decimal без научной нотации
+        Decimal::from_str(s).ok()
+    }
 }

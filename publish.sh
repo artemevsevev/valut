@@ -1,6 +1,6 @@
 #!/bin/bash
 
-version="0.1.0"
+version="0.2.0"
 
 docker build --tag valut:$version --platform="linux/amd64" --file Dockerfile .
 docker save valut:$version > ../valut-$version.tar

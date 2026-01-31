@@ -1,5 +1,5 @@
 
-FROM rust:1.88.0 AS builder
+FROM rust:1.93.0 AS builder
 
 WORKDIR /usr/src/valut
 COPY . .
