@@ -240,31 +240,30 @@ async fn set_exchange_rate(
     rate: &Decimal,
     pool: &Pool<Postgres>,
 ) -> Result<()> {
-    let exchange_rate: Option<ExchangeRate> = sqlx::query_as!(
-        ExchangeRate,
+    let exchange_rate: Option<ExchangeRate> = sqlx::query_as(
         r#"
             SELECT id, rate
             FROM exchange_rates
             WHERE from_currency = $1 AND to_currency = $2 AND date = $3
         "#,
-        from_currency,
-        to_currency,
-        date
     )
+    .bind(&from_currency)
+    .bind(&to_currency)
+    .bind(date)
     .fetch_optional(pool)
     .await?;
 
     if let Some(exchange_rate) = exchange_rate {
         if exchange_rate.rate != *rate {
-            sqlx::query!(
+            sqlx::query(
                 r#"
                     UPDATE exchange_rates
                     SET rate = $1, updated_at = NOW()
                     WHERE id = $2
                 "#,
-                rate,
-                exchange_rate.id
             )
+            .bind(rate)
+            .bind(exchange_rate.id)
             .execute(pool)
             .await?;
 
@@ -277,16 +276,16 @@ async fn set_exchange_rate(
             );
         }
     } else {
-        sqlx::query!(
+        sqlx::query(
             r#"
                 INSERT INTO exchange_rates (from_currency, to_currency, rate, date, created_at, updated_at)
                 VALUES ($1, $2, $3, $4, NOW(), NOW())
             "#,
-            from_currency,
-            to_currency,
-            rate,
-            date
         )
+        .bind(from_currency)
+        .bind(to_currency)
+        .bind(rate)
+        .bind(date)
         .execute(pool)
         .await?;
 
