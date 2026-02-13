@@ -19,6 +19,7 @@ FROM debian:trixie-slim AS runtime
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     libssl3t64 \
+    curl \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /usr/src/valut/target/release/valut /usr/local/bin/valut
