@@ -16,19 +16,25 @@ mod val_curs;
 
 const DELAY_SEC: u64 = 60 * 20;
 const RETRYDELAY_SEC: u64 = 5;
+const CURRENCIES_VAR: &str = "CURRENCIES";
+const DEFAULT_CURRENCIES: &str = "USD,EUR";
+const BASE_CURRENCY: &str = "RUB";
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    env_logger::init();
     dotenvy::dotenv().ok();
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+
+    let currencies = get_currencies()?;
 
     start_server().await?;
 
     log::info!("Valut started");
+    log::info!("Currencies: {:?}", currencies);
 
     tokio::select! {
         _ = async {
-            main_loop().await;
+            main_loop(&currencies).await;
 
             #[allow(unreachable_code)]
             Ok::<(), anyhow::Error>(())
@@ -43,7 +49,7 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-async fn main_loop() {
+async fn main_loop(currencies: &[String]) {
     let mut retry_count = 0;
     let mut delay_sec = 0;
     let mut last_execution = DateTime::<Utc>::MIN_UTC;
@@ -61,7 +67,7 @@ async fn main_loop() {
         {
             last_try = Utc::now();
 
-            match execute().await {
+            match execute(currencies).await {
                 Ok(_) => {
                     retry_count = 0;
                     delay_sec = 0;
@@ -120,7 +126,7 @@ async fn health() -> impl Responder {
     HttpResponse::Ok().body("OK")
 }
 
-async fn execute() -> Result<()> {
+async fn execute(currencies: &[String]) -> Result<()> {
     let today = Utc::now().date_naive();
     let start_date = today
         .checked_sub_days(Days::new(6))
@@ -129,24 +135,23 @@ async fn execute() -> Result<()> {
         .checked_add_days(Days::new(1))
         .ok_or(anyhow::anyhow!("Can't get next date for {}", today))?;
 
-    iterate(start_date, end_date).await?;
+    iterate(start_date, end_date, currencies).await?;
 
     Ok(())
 }
 
-async fn iterate(start_date: NaiveDate, end_date: NaiveDate) -> Result<()> {
+async fn iterate(start_date: NaiveDate, end_date: NaiveDate, currencies: &[String]) -> Result<()> {
     if start_date > end_date {
         return Err(anyhow::anyhow!("Start date must be before end date"));
     }
 
     let mut current_date = end_date;
     let pool = get_db_pool().await?;
-    let currencies = get_currencies();
 
     while current_date >= start_date {
         let exchange_rates = get_exchange_rates_for_date(current_date).await?;
 
-        update_stored_exchange_rates(&current_date, &exchange_rates, &pool, &currencies).await?;
+        update_stored_exchange_rates(&current_date, &exchange_rates, &pool, currencies).await?;
 
         current_date = current_date
             .pred_opt()
@@ -212,19 +217,20 @@ async fn update_stored_exchange_rates(
     date: &NaiveDate,
     exchange_rates: &HashMap<String, Decimal>,
     pool: &Pool<Postgres>,
-    currencies: &Vec<String>,
+    currencies: &[String],
 ) -> Result<()> {
     for currency in currencies {
-        let rate = exchange_rates.get(currency).ok_or(anyhow!(
-            "There is not val_cur for {} at {}",
-            &currency,
-            &date
-        ))?;
-        if rate.is_zero() {
-            println!("Rate is zero for {} at {}", &currency, &date);
-        }
-        let reverse_rate = Decimal::ONE / rate;
-        let rub = "RUB".to_string();
+        let Some(rate) = exchange_rates.get(currency) else {
+            log::warn!("There is no val_cur for {} at {}, skipping", currency, date);
+            continue;
+        };
+
+        let Some(reverse_rate) = Decimal::ONE.checked_div(*rate) else {
+            log::warn!("Rate is zero for {} at {}, skipping", currency, date);
+            continue;
+        };
+
+        let rub = BASE_CURRENCY.to_string();
 
         set_exchange_rate(date, currency, &rub, rate, pool).await?;
         set_exchange_rate(date, &rub, currency, &reverse_rate, pool).await?;
@@ -324,8 +330,38 @@ async fn get_connection_string() -> Result<String> {
     Ok(connection_string)
 }
 
-fn get_currencies() -> Vec<String> {
-    vec!["USD".to_string(), "EUR".to_string()]
+fn get_currencies() -> Result<Vec<String>> {
+    let raw = env::var(CURRENCIES_VAR).unwrap_or_else(|_| DEFAULT_CURRENCIES.to_string());
+    let currencies = parse_currencies(&raw);
+
+    if currencies.is_empty() {
+        return Err(anyhow!(
+            "{} is set to {:?} but contains no usable currency codes",
+            CURRENCIES_VAR,
+            raw
+        ));
+    }
+
+    Ok(currencies)
+}
+
+/// Разбирает список валют вида "USD, EUR, KZT": убирает пробелы и пустые
+/// элементы, приводит к верхнему регистру, отбрасывает базовую валюту
+/// (её ЦБ не котирует) и дубликаты, сохраняя порядок.
+fn parse_currencies(raw: &str) -> Vec<String> {
+    let mut currencies: Vec<String> = Vec::new();
+
+    for code in raw.split(',') {
+        let code = code.trim().to_uppercase();
+
+        if code.is_empty() || code == BASE_CURRENCY || currencies.contains(&code) {
+            continue;
+        }
+
+        currencies.push(code);
+    }
+
+    currencies
 }
 
 fn next_delay(value: u64) -> u64 {
@@ -360,5 +396,68 @@ fn parse_decimal_string(s: &str) -> Option<Decimal> {
     } else {
         // Обычный decimal без научной нотации
         Decimal::from_str(s).ok()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_plain_list() {
+        assert_eq!(parse_currencies("USD, EUR, KZT"), ["USD", "EUR", "KZT"]);
+    }
+
+    #[test]
+    fn trims_uppercases_and_drops_empty_items() {
+        assert_eq!(parse_currencies(" usd ,, EUR "), ["USD", "EUR"]);
+    }
+
+    #[test]
+    fn drops_duplicates_keeping_order() {
+        assert_eq!(parse_currencies("EUR,USD,eur"), ["EUR", "USD"]);
+    }
+
+    #[test]
+    fn drops_base_currency() {
+        assert_eq!(parse_currencies("RUB,USD"), ["USD"]);
+    }
+
+    #[test]
+    fn returns_empty_for_blank_input() {
+        assert!(parse_currencies("").is_empty());
+        assert!(parse_currencies(" , ").is_empty());
+        assert!(parse_currencies("RUB").is_empty());
+    }
+
+    /// Номинал KZT равен 100, но ЦБ отдаёт `VunitRate` уже за одну единицу,
+    /// поэтому делить на номинал не нужно.
+    #[tokio::test]
+    async fn uses_per_unit_rate_for_currencies_with_nominal_above_one() {
+        let xml = r#"
+            <ValCurs Date="19.09.2026" name="Foreign Currency Market">
+                <Valute ID="R01235">
+                    <NumCode>840</NumCode><CharCode>USD</CharCode>
+                    <Nominal>1</Nominal><Name>Доллар США</Name>
+                    <Value>82,1234</Value><VunitRate>82,1234</VunitRate>
+                </Valute>
+                <Valute ID="R01335">
+                    <NumCode>398</NumCode><CharCode>KZT</CharCode>
+                    <Nominal>100</Nominal><Name>Тенге</Name>
+                    <Value>18,9387</Value><VunitRate>0,189387</VunitRate>
+                </Valute>
+            </ValCurs>
+        "#;
+
+        let val_curs: ValCurs = quick_xml::de::from_str(xml).unwrap();
+        let rates = get_curs_map(&val_curs).await.unwrap();
+
+        assert_eq!(rates["KZT"], Decimal::from_str("0.189387").unwrap());
+        assert_eq!(rates["USD"], Decimal::from_str("82.1234").unwrap());
+    }
+
+    #[test]
+    fn default_list_matches_previous_hardcoded_behaviour() {
+        assert_eq!(parse_currencies(DEFAULT_CURRENCIES), ["USD", "EUR"]);
     }
 }
