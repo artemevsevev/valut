@@ -233,30 +233,65 @@ async fn update_stored_exchange_rates(
     pool: &Pool<Postgres>,
     currencies: &[String],
 ) -> Result<()> {
+    let mut quotes: Vec<(&str, Decimal)> = vec![(BASE_CURRENCY, Decimal::ONE)];
+
     for currency in currencies {
         let Some(rate) = exchange_rates.get(currency) else {
             log::warn!("There is no val_cur for {} at {}, skipping", currency, date);
             continue;
         };
 
-        let Some(reverse_rate) = Decimal::ONE.checked_div(*rate) else {
+        if *rate == Decimal::ZERO {
             log::warn!("Rate is zero for {} at {}, skipping", currency, date);
             continue;
-        };
+        }
 
-        let rub = BASE_CURRENCY.to_string();
+        quotes.push((currency.as_str(), *rate));
+    }
 
-        set_exchange_rate(date, currency, &rub, rate, pool).await?;
-        set_exchange_rate(date, &rub, currency, &reverse_rate, pool).await?;
+    for (from_currency, to_currency, rate) in rate_pairs(&quotes) {
+        set_exchange_rate(date, from_currency, to_currency, &rate, pool).await?;
     }
 
     Ok(())
 }
 
+/// Все упорядоченные пары валют: курс `from -> to` — сколько единиц `to` дают
+/// за одну единицу `from`. ЦБ кросс-курсы не публикует, поэтому они считаются
+/// через рубль. Рубль при этом сам присутствует в `quotes` с курсом 1, так что
+/// пары с ним получаются той же формулой, что и кросс-курсы, и остаются
+/// такими же, как до появления кросс-курсов.
+fn rate_pairs<'a>(quotes: &[(&'a str, Decimal)]) -> Vec<(&'a str, &'a str, Decimal)> {
+    let mut pairs = Vec::with_capacity(quotes.len() * quotes.len().saturating_sub(1));
+
+    for (from_currency, from_rate) in quotes {
+        for (to_currency, to_rate) in quotes {
+            if from_currency == to_currency {
+                continue;
+            }
+
+            // Нулевые курсы отсеяны при сборе `quotes`, поэтому `None` здесь —
+            // это переполнение. Молча терять такую пару не стоит.
+            let Some(rate) = from_rate.checked_div(*to_rate) else {
+                log::warn!(
+                    "Can't compute rate {} -> {}, skipping",
+                    from_currency,
+                    to_currency
+                );
+                continue;
+            };
+
+            pairs.push((*from_currency, *to_currency, rate));
+        }
+    }
+
+    pairs
+}
+
 async fn set_exchange_rate(
     date: &NaiveDate,
-    from_currency: &String,
-    to_currency: &String,
+    from_currency: &str,
+    to_currency: &str,
     rate: &Decimal,
     pool: &Pool<Postgres>,
 ) -> Result<()> {
@@ -267,8 +302,8 @@ async fn set_exchange_rate(
             WHERE from_currency = $1 AND to_currency = $2 AND date = $3
         "#,
     )
-    .bind(&from_currency)
-    .bind(&to_currency)
+    .bind(from_currency)
+    .bind(to_currency)
     .bind(date)
     .fetch_optional(pool)
     .await?;
@@ -485,6 +520,109 @@ mod tests {
     #[test]
     fn default_list_matches_previous_hardcoded_behaviour() {
         assert_eq!(parse_currencies(DEFAULT_CURRENCIES), ["USD", "EUR"]);
+    }
+
+    /// Котировки к рублю в том виде, в каком их собирает
+    /// [`update_stored_exchange_rates`]: рубль первым с курсом 1, далее валюты
+    /// в порядке `CURRENCIES`. Значения USD и KZT — те же `VunitRate`, что и в
+    /// XML-фикстуре теста на номинал.
+    fn quotes_fixture() -> Vec<(&'static str, Decimal)> {
+        vec![
+            (BASE_CURRENCY, Decimal::ONE),
+            ("USD", Decimal::from_str("82.1234").unwrap()),
+            ("EUR", Decimal::from_str("96.5432").unwrap()),
+            ("KZT", Decimal::from_str("0.189387").unwrap()),
+        ]
+    }
+
+    fn rate_of(pairs: &[(&str, &str, Decimal)], from: &str, to: &str) -> Decimal {
+        pairs
+            .iter()
+            .find(|(pair_from, pair_to, _)| *pair_from == from && *pair_to == to)
+            .unwrap_or_else(|| panic!("no pair {} -> {}", from, to))
+            .2
+    }
+
+    /// Кросс-курс считается из `VunitRate`, которые уже приведены к одной
+    /// единице. Делить сырые `Value` нельзя: у KZT номинал 100, и результат
+    /// оказался бы в сто раз меньше — 4.34 вместо 433.63.
+    #[test]
+    fn cross_rate_uses_per_unit_quotes() {
+        let pairs = rate_pairs(&quotes_fixture());
+
+        assert_eq!(
+            rate_of(&pairs, "USD", "KZT").round_dp(4),
+            Decimal::from_str("433.6274").unwrap()
+        );
+    }
+
+    #[test]
+    fn cross_rate_is_written_for_both_directions() {
+        let pairs = rate_pairs(&quotes_fixture());
+        let usd = Decimal::from_str("82.1234").unwrap();
+        let kzt = Decimal::from_str("0.189387").unwrap();
+
+        assert_eq!(rate_of(&pairs, "KZT", "USD"), kzt.checked_div(usd).unwrap());
+        assert_eq!(
+            (rate_of(&pairs, "USD", "KZT") * rate_of(&pairs, "KZT", "USD")).round_dp(10),
+            Decimal::ONE
+        );
+    }
+
+    /// Появление кросс-курсов не должно менять уже записанные пары с рублём.
+    #[test]
+    fn base_currency_pairs_keep_previous_values() {
+        let pairs = rate_pairs(&quotes_fixture());
+        let usd = Decimal::from_str("82.1234").unwrap();
+
+        assert_eq!(rate_of(&pairs, "USD", BASE_CURRENCY), usd);
+        assert_eq!(
+            rate_of(&pairs, BASE_CURRENCY, "USD"),
+            Decimal::ONE.checked_div(usd).unwrap()
+        );
+    }
+
+    #[test]
+    fn covers_every_ordered_pair_without_self_pairs() {
+        let pairs = rate_pairs(&quotes_fixture());
+
+        assert_eq!(pairs.len(), 12);
+        assert!(pairs.iter().all(|(from, to, _)| from != to));
+
+        let mut codes: Vec<&str> = pairs.iter().map(|(from, _, _)| *from).collect();
+        codes.sort_unstable();
+        codes.dedup();
+
+        assert_eq!(codes, ["EUR", "KZT", "RUB", "USD"]);
+    }
+
+    /// Валюта, которой нет в ответе ЦБ, не попадает в `quotes` — вместе с ней
+    /// исчезают только её пары, остальные считаются как обычно.
+    #[test]
+    fn skips_pairs_of_unavailable_currency() {
+        let quotes: Vec<(&str, Decimal)> = quotes_fixture()
+            .into_iter()
+            .filter(|(code, _)| *code != "EUR")
+            .collect();
+
+        let pairs = rate_pairs(&quotes);
+
+        assert_eq!(pairs.len(), 6);
+        assert!(
+            pairs
+                .iter()
+                .all(|(from, to, _)| *from != "EUR" && *to != "EUR")
+        );
+        assert_eq!(
+            rate_of(&pairs, "USD", "KZT").round_dp(4),
+            Decimal::from_str("433.6274").unwrap()
+        );
+        assert_eq!(
+            rate_of(&pairs, BASE_CURRENCY, "USD"),
+            Decimal::ONE
+                .checked_div(Decimal::from_str("82.1234").unwrap())
+                .unwrap()
+        );
     }
 
     #[test]
