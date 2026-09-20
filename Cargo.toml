@@ -4,23 +4,23 @@ version = "0.3.1"
 edition = "2024"
 
 [dependencies]
-tokio = { version = "1.49.0", features = ["full"] }
-serde = { version = "1.0.228", features = ["derive"] }
-reqwest = { version = "0.13.2" }
-anyhow = "1.0.101"
-quick-xml = { version = "0.39.0", features = ["serde", "serialize"] }
-chrono = "0.4.43"
-rust_decimal = { version = "1.40.0", features = ["db-postgres"] }
-sqlx = { version = "0.8.6", features = [
+tokio = { version = "1.53.1", features = ["full"] }
+serde = { version = "1.0.229", features = ["derive"] }
+reqwest = { version = "0.13.5" }
+anyhow = "1.0.104"
+quick-xml = { version = "0.42.0", features = ["serde", "serialize"] }
+chrono = "0.4.45"
+rust_decimal = { version = "1.43.0", features = ["db-postgres"] }
+sqlx = { version = "0.9.0", features = [
     "postgres",
-    "runtime-tokio-rustls",
+    "runtime-tokio",
     "chrono",
     "macros",
     "rust_decimal",
     "uuid",
 ] }
 dotenvy = "0.15.7"
-uuid = "1.20.0"
-log = "0.4.29"
-env_logger = "0.11.9"
-actix-web = "4.12.1"
+uuid = "1.26.1"
+log = "0.4.34"
+env_logger = "0.11.11"
+actix-web = "4.15.0"

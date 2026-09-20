@@ -1,4 +1,4 @@
-FROM rust:1.93.1 AS chef
+FROM rust:latest AS chef
 RUN cargo install cargo-chef
 WORKDIR /usr/src/valut
 
