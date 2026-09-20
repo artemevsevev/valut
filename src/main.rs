@@ -2,11 +2,14 @@ use std::{collections::HashMap, env, str::FromStr, time::Duration};
 
 use actix_web::{App, HttpResponse, HttpServer, Responder, get};
 use anyhow::{Result, anyhow};
-use chrono::{DateTime, Days, NaiveDate, Timelike, Utc};
+use chrono::{Days, NaiveDate, Utc};
 use reqwest::Client;
 use rust_decimal::Decimal;
-use sqlx::{PgPool, Pool, Postgres};
-use tokio::signal::unix::{SignalKind, signal};
+use sqlx::{Pool, Postgres, postgres::PgPoolOptions};
+use tokio::{
+    signal::unix::{SignalKind, signal},
+    time::MissedTickBehavior,
+};
 use val_curs::ValCurs;
 
 use crate::exchange_rate::ExchangeRate;
@@ -14,8 +17,10 @@ use crate::exchange_rate::ExchangeRate;
 mod exchange_rate;
 mod val_curs;
 
-const DELAY_SEC: u64 = 60 * 20;
-const RETRYDELAY_SEC: u64 = 5;
+const PERIOD: Duration = Duration::from_secs(60 * 20);
+const RETRY_DELAY: Duration = Duration::from_secs(5);
+const MAX_RETRIES: u32 = 10;
+const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 const CURRENCIES_VAR: &str = "CURRENCIES";
 const DEFAULT_CURRENCIES: &str = "USD,EUR";
 const BASE_CURRENCY: &str = "RUB";
@@ -26,6 +31,8 @@ async fn main() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
     let currencies = get_currencies()?;
+    let pool = get_db_pool()?;
+    let client = get_http_client()?;
 
     start_server().await?;
 
@@ -33,15 +40,9 @@ async fn main() -> Result<()> {
     log::info!("Currencies: {:?}", currencies);
 
     tokio::select! {
-        _ = async {
-            main_loop(&currencies).await;
+        _ = main_loop(&currencies, &pool, &client) => {},
 
-            #[allow(unreachable_code)]
-            Ok::<(), anyhow::Error>(())
-        } => {},
-
-        _ = shutdown_signal() => {
-        },
+        _ = shutdown_signal() => {},
     };
 
     log::info!("Valut ended");
@@ -49,51 +50,57 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-async fn main_loop(currencies: &[String]) {
-    let mut retry_count = 0;
-    let mut delay_sec = 0;
-    let mut last_execution = DateTime::<Utc>::MIN_UTC;
-    let mut last_try = DateTime::<Utc>::MIN_UTC;
+/// Раз в [`PERIOD`] перечитывает окно дат у ЦБ. Первый тик срабатывает сразу,
+/// поэтому прогон происходит и при старте сервиса.
+async fn main_loop(currencies: &[String], pool: &Pool<Postgres>, client: &Client) -> ! {
+    let mut ticker = tokio::time::interval(PERIOD);
+    // Затянувшийся прогон не должен приводить к очереди пропущенных тиков,
+    // которые дефолтный `Burst` выстрелил бы подряд.
+    ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
     loop {
-        let next_execution = last_execution + Duration::from_secs(DELAY_SEC);
-        let next_try = last_try + Duration::from_secs(delay_sec);
-        let now = Utc::now();
+        ticker.tick().await;
 
-        if (now >= next_execution
-            || last_execution.date_naive() != now.date_naive()
-            || last_execution.hour() != now.hour())
-            && now >= next_try
-        {
-            last_try = Utc::now();
-
-            match execute(currencies).await {
-                Ok(_) => {
-                    retry_count = 0;
-                    delay_sec = 0;
-                    last_execution = Utc::now();
-                    last_try = DateTime::<Utc>::MIN_UTC;
-                }
-
-                Err(err) => {
-                    log::error!("Error executing task: {:?}", err);
-                    retry_count += 1;
-                    delay_sec = match delay_sec {
-                        0 => RETRYDELAY_SEC,
-                        n => next_delay(n),
-                    };
-                    dbg!(retry_count, delay_sec);
-                }
-            }
-        };
-
-        if retry_count > 10 {
-            log::error!("Max retries exceeded");
-            break;
+        if let Err(err) = execute_with_retries(currencies, pool, client).await {
+            log::error!("Max retries exceeded, waiting for next tick: {:?}", err);
         }
 
-        tokio::time::sleep(Duration::from_secs(1)).await;
+        // Одного `Delay` мало: пропущенный тик он отдаёт немедленно, поэтому
+        // после прогона длиннее PERIOD следующий начался бы без паузы. `reset`
+        // переносит следующий тик на PERIOD от момента завершения прогона.
+        ticker.reset();
     }
+}
+
+async fn execute_with_retries(
+    currencies: &[String],
+    pool: &Pool<Postgres>,
+    client: &Client,
+) -> Result<()> {
+    let mut delay = RETRY_DELAY;
+
+    for attempt in 1..=MAX_RETRIES {
+        match execute(currencies, pool, client).await {
+            Ok(()) => return Ok(()),
+
+            Err(err) if attempt == MAX_RETRIES => return Err(err),
+
+            Err(err) => {
+                log::warn!(
+                    "Attempt {}/{} failed: {:?}; retrying in {:?}",
+                    attempt,
+                    MAX_RETRIES,
+                    err,
+                    delay
+                );
+
+                tokio::time::sleep(delay).await;
+                delay = next_delay(delay);
+            }
+        }
+    }
+
+    unreachable!("the loop returns on the last attempt")
 }
 
 async fn shutdown_signal() -> Result<()> {
@@ -126,7 +133,7 @@ async fn health() -> impl Responder {
     HttpResponse::Ok().body("OK")
 }
 
-async fn execute(currencies: &[String]) -> Result<()> {
+async fn execute(currencies: &[String], pool: &Pool<Postgres>, client: &Client) -> Result<()> {
     let today = Utc::now().date_naive();
     let start_date = today
         .checked_sub_days(Days::new(6))
@@ -135,23 +142,28 @@ async fn execute(currencies: &[String]) -> Result<()> {
         .checked_add_days(Days::new(1))
         .ok_or(anyhow::anyhow!("Can't get next date for {}", today))?;
 
-    iterate(start_date, end_date, currencies).await?;
+    iterate(start_date, end_date, currencies, pool, client).await?;
 
     Ok(())
 }
 
-async fn iterate(start_date: NaiveDate, end_date: NaiveDate, currencies: &[String]) -> Result<()> {
+async fn iterate(
+    start_date: NaiveDate,
+    end_date: NaiveDate,
+    currencies: &[String],
+    pool: &Pool<Postgres>,
+    client: &Client,
+) -> Result<()> {
     if start_date > end_date {
         return Err(anyhow::anyhow!("Start date must be before end date"));
     }
 
     let mut current_date = end_date;
-    let pool = get_db_pool().await?;
 
     while current_date >= start_date {
-        let exchange_rates = get_exchange_rates_for_date(current_date).await?;
+        let exchange_rates = get_exchange_rates_for_date(current_date, client).await?;
 
-        update_stored_exchange_rates(&current_date, &exchange_rates, &pool, currencies).await?;
+        update_stored_exchange_rates(&current_date, &exchange_rates, pool, currencies).await?;
 
         current_date = current_date
             .pred_opt()
@@ -161,8 +173,11 @@ async fn iterate(start_date: NaiveDate, end_date: NaiveDate, currencies: &[Strin
     Ok(())
 }
 
-async fn get_exchange_rates_for_date(date: NaiveDate) -> Result<HashMap<String, Decimal>> {
-    let val_curs = get_val_curs(date).await?;
+async fn get_exchange_rates_for_date(
+    date: NaiveDate,
+    client: &Client,
+) -> Result<HashMap<String, Decimal>> {
+    let val_curs = get_val_curs(date, client).await?;
 
     Ok(get_curs_map(&val_curs).await?)
 }
@@ -185,16 +200,15 @@ fn normalize_decimal_string(s: &str) -> String {
     s.replace(',', ".")
 }
 
-async fn get_val_curs(date: NaiveDate) -> Result<ValCurs> {
+async fn get_val_curs(date: NaiveDate, client: &Client) -> Result<ValCurs> {
     let url = get_url(date).await;
-    let text = load_xml(&url).await?;
+    let text = load_xml(&url, client).await?;
     let val_curs: ValCurs = quick_xml::de::from_str(&text)?;
 
     Ok(val_curs)
 }
 
-async fn load_xml(url: &str) -> Result<String> {
-    let client = Client::new();
+async fn load_xml(url: &str, client: &Client) -> Result<String> {
     let response = client.get(url).send().await?;
 
     if !response.status().is_success() {
@@ -307,15 +321,24 @@ async fn set_exchange_rate(
     Ok(())
 }
 
-async fn get_db_pool() -> Result<Pool<Postgres>> {
-    let connection_string = get_connection_string().await?;
+/// Пул создаётся лениво: сеть не трогается до первого запроса, поэтому старт
+/// сервиса раньше БД не роняет процесс, а остаётся ретраибельной ошибкой
+/// внутри [`main_loop`].
+fn get_db_pool() -> Result<Pool<Postgres>> {
+    let connection_string = get_connection_string()?;
 
-    let pool = PgPool::connect(&connection_string).await?;
+    let pool = PgPoolOptions::new().connect_lazy(&connection_string)?;
 
     Ok(pool)
 }
 
-async fn get_connection_string() -> Result<String> {
+fn get_http_client() -> Result<Client> {
+    let client = Client::builder().timeout(HTTP_TIMEOUT).build()?;
+
+    Ok(client)
+}
+
+fn get_connection_string() -> Result<String> {
     let username = env::var("POSTGRES_USER")?;
     let password = env::var("POSTGRES_PASSWORD")?;
     let host = env::var("DB_HOST")?;
@@ -364,9 +387,12 @@ fn parse_currencies(raw: &str) -> Vec<String> {
     currencies
 }
 
-fn next_delay(value: u64) -> u64 {
+/// Следующая пауза между ретраями: золотое сечение, округлённое до целых
+/// секунд — 5, 8, 13, 21, 34, 55, 89, 144, 233.
+fn next_delay(value: Duration) -> Duration {
     let phi = (1.0 + 5.0_f64.sqrt()) / 2.0;
-    (phi * (value as f64)).round() as u64
+
+    Duration::from_secs((phi * value.as_secs_f64()).round() as u64)
 }
 
 fn parse_decimal_string(s: &str) -> Option<Decimal> {
@@ -459,5 +485,18 @@ mod tests {
     #[test]
     fn default_list_matches_previous_hardcoded_behaviour() {
         assert_eq!(parse_currencies(DEFAULT_CURRENCIES), ["USD", "EUR"]);
+    }
+
+    #[test]
+    fn backoff_follows_whole_second_golden_ratio() {
+        let mut delay = RETRY_DELAY;
+        let mut sequence = vec![delay.as_secs()];
+
+        for _ in 1..9 {
+            delay = next_delay(delay);
+            sequence.push(delay.as_secs());
+        }
+
+        assert_eq!(sequence, [5, 8, 13, 21, 34, 55, 89, 144, 233]);
     }
 }
